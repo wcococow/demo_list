@@ -1,169 +1,327 @@
+"""
+API-layer tests for main.py.
+Uses FastAPI TestClient with SQLite (StaticPool) and mocked Redis/Celery.
+"""
 import pytest
+from unittest.mock import MagicMock, patch
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from database import Base
-from main import app, get_db
+from database import Base, get_db
+from models import User
+from auth import create_access_token, hash_password
+import uuid
 
-# StaticPool forces all connections to share the same in-memory database.
-# Without it, each new connection gets a blank :memory: database, so tables
-# created by Base.metadata.create_all() vanish before the session sees them.
-engine = create_engine(
+
+# ── app & DB setup ────────────────────────────────────────────────────────────
+
+_engine = create_engine(
     "sqlite:///:memory:",
     connect_args={"check_same_thread": False},
     poolclass=StaticPool,
 )
-TestingSessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+_Session = sessionmaker(bind=_engine, autocommit=False, autoflush=False)
+
+
+def _override_db():
+    db = _Session()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+@pytest.fixture(scope="session")
+def app_client():
+    """One TestClient for the whole session; tables are managed per-test."""
+    Base.metadata.create_all(bind=_engine)
+
+    from main import app
+    app.dependency_overrides[get_db] = _override_db
+
+    with patch("alembic.command.upgrade"):       # skip migrations in lifespan
+        with TestClient(app, raise_server_exceptions=False) as c:
+            yield c
+
+    app.dependency_overrides.clear()
+    Base.metadata.drop_all(bind=_engine)
 
 
 @pytest.fixture(autouse=True)
-def reset_db():
-    # Create all tables fresh before each test, drop them after — fully isolated
-    Base.metadata.create_all(bind=engine)
+def clean_tables():
+    """Wipe all rows before each test for isolation."""
     yield
-    Base.metadata.drop_all(bind=engine)
+    db = _Session()
+    try:
+        for table in reversed(Base.metadata.sorted_tables):
+            db.execute(table.delete())
+        db.commit()
+    finally:
+        db.close()
 
 
-@pytest.fixture
-# Explicit dependency on reset_db guarantees tables exist before TestClient starts
-def client(reset_db):
-    def override_get_db():
-        db = TestingSessionLocal()
-        try:
-            yield db
-        finally:
-            db.close()
+# ── auth helpers ──────────────────────────────────────────────────────────────
 
-    app.dependency_overrides[get_db] = override_get_db
-    with TestClient(app) as c:
-        yield c
-    app.dependency_overrides.clear()
-
-
-# ── helpers ──────────────────────────────────────────────────────────────────
-
-def create_task(client, title="Buy milk"):
-    return client.post("/tasks", json={"title": title})
+def _make_user(username="tester") -> tuple[User, str]:
+    """Insert a user into the in-memory DB and return (user, jwt_token)."""
+    db = _Session()
+    user = User(id=str(uuid.uuid4()), username=username, hashed_password=hash_password("secret123"))
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    db.close()
+    session_id = str(uuid.uuid4())
+    token = create_access_token(user.id, session_id)
+    return user, token, session_id
 
 
-# ── CREATE ────────────────────────────────────────────────────────────────────
-
-def test_create_task_returns_201(client):
-    res = create_task(client)
-    assert res.status_code == 201
-    body = res.json()
-    assert body["title"] == "Buy milk"
-    assert body["is_done"] is False
-    assert "id" in body
+def _auth(token: str) -> dict:
+    return {"Authorization": f"Bearer {token}"}
 
 
-def test_create_task_empty_title_rejected(client):
-    # FIX #4 — empty title must be rejected at the schema level
-    res = client.post("/tasks", json={"title": ""})
-    assert res.status_code == 422
+# ── health ────────────────────────────────────────────────────────────────────
+
+class TestHealth:
+    def test_ok(self, app_client):
+        r = app_client.get("/health")
+        assert r.status_code == 200
+        assert r.json()["status"] == "ok"
 
 
-def test_create_task_whitespace_only_rejected(client):
-    # FIX #4 — strip_whitespace means "   " collapses to "" and fails min_length
-    res = client.post("/tasks", json={"title": "   "})
-    assert res.status_code == 422
+# ── register ──────────────────────────────────────────────────────────────────
+
+class TestRegister:
+    def test_success(self, app_client):
+        with patch("user_service.create_session", return_value="s1"), \
+             patch("user_service.is_account_locked", return_value=False), \
+             patch("user_service.clear_failed_logins"):
+            r = app_client.post("/auth/register", json={"username": "alice", "password": "pass123"})
+        assert r.status_code == 201
+        assert r.json()["username"] == "alice"
+        assert "id" in r.json()
+
+    def test_duplicate_returns_409(self, app_client):
+        with patch("user_service.create_session", return_value="s"), \
+             patch("user_service.is_account_locked", return_value=False), \
+             patch("user_service.clear_failed_logins"):
+            app_client.post("/auth/register", json={"username": "dup", "password": "pass123"})
+            r = app_client.post("/auth/register", json={"username": "dup", "password": "pass123"})
+        assert r.status_code == 409
+
+    def test_short_password_rejected(self, app_client):
+        r = app_client.post("/auth/register", json={"username": "bob", "password": "x"})
+        assert r.status_code == 422
+
+    def test_empty_username_rejected(self, app_client):
+        r = app_client.post("/auth/register", json={"username": "", "password": "pass123"})
+        assert r.status_code == 422
 
 
-# ── READ ALL ──────────────────────────────────────────────────────────────────
+# ── login ─────────────────────────────────────────────────────────────────────
 
-def test_get_all_tasks_empty(client):
-    res = client.get("/tasks")
-    assert res.status_code == 200
-    assert res.json() == []
+class TestLogin:
+    def _register(self, client, username="loginuser"):
+        with patch("user_service.create_session", return_value="s"), \
+             patch("user_service.is_account_locked", return_value=False), \
+             patch("user_service.clear_failed_logins"):
+            client.post("/auth/register", json={"username": username, "password": "secret123"})
 
+    def test_success_returns_token(self, app_client):
+        self._register(app_client)
+        with patch("user_service.is_account_locked", return_value=False), \
+             patch("user_service.clear_failed_logins"), \
+             patch("user_service.create_session", return_value="sess-x"):
+            r = app_client.post("/auth/login", data={"username": "loginuser", "password": "secret123"})
+        assert r.status_code == 200
+        assert "access_token" in r.json()
+        assert r.json()["token_type"] == "bearer"
 
-def test_get_all_tasks_returns_created(client):
-    create_task(client, "Task A")
-    create_task(client, "Task B")
-    res = client.get("/tasks")
-    assert res.status_code == 200
-    assert len(res.json()) == 2
+    def test_wrong_password_returns_401(self, app_client):
+        self._register(app_client)
+        with patch("user_service.is_account_locked", return_value=False), \
+             patch("user_service.record_failed_login"):
+            r = app_client.post("/auth/login", data={"username": "loginuser", "password": "wrong"})
+        assert r.status_code == 401
 
+    def test_unknown_user_returns_401(self, app_client):
+        with patch("user_service.is_account_locked", return_value=False), \
+             patch("user_service.record_failed_login"):
+            r = app_client.post("/auth/login", data={"username": "nobody", "password": "pass"})
+        assert r.status_code == 401
 
-def test_get_all_tasks_pagination(client):
-    # FIX #5 — pagination keeps large tables from being returned whole
-    for i in range(5):
-        create_task(client, f"Task {i}")
-    res = client.get("/tasks?skip=2&limit=2")
-    assert res.status_code == 200
-    assert len(res.json()) == 2
-
-
-# ── READ ONE ──────────────────────────────────────────────────────────────────
-
-def test_get_task_by_id(client):
-    task_id = create_task(client).json()["id"]
-    res = client.get(f"/tasks/{task_id}")
-    assert res.status_code == 200
-    assert res.json()["id"] == task_id
-
-
-def test_get_task_not_found_returns_404(client):
-    # FIX #6 — missing record must surface as 404, not 500
-    res = client.get("/tasks/nonexistent-id")
-    assert res.status_code == 404
-
-
-# ── UPDATE ────────────────────────────────────────────────────────────────────
-
-def test_update_task_title(client):
-    task_id = create_task(client).json()["id"]
-    res = client.patch(f"/tasks/{task_id}", json={"title": "Updated title"})
-    assert res.status_code == 200
-    assert res.json()["title"] == "Updated title"
+    def test_locked_account_returns_423(self, app_client):
+        self._register(app_client)
+        with patch("user_service.is_account_locked", return_value=True):
+            r = app_client.post("/auth/login", data={"username": "loginuser", "password": "secret123"})
+        assert r.status_code == 423
 
 
-def test_update_task_mark_done(client):
-    task_id = create_task(client).json()["id"]
-    res = client.patch(f"/tasks/{task_id}", json={"is_done": True})
-    assert res.status_code == 200
-    assert res.json()["is_done"] is True
+# ── logout ────────────────────────────────────────────────────────────────────
+
+class TestLogout:
+    def test_success(self, app_client):
+        user, token, session_id = _make_user("logout_user")
+        with patch("session_manager.get_session_user_id", return_value=user.id), \
+             patch("session_manager.invalidate_session") as mock_inv:
+            r = app_client.post("/auth/logout", headers=_auth(token))
+        assert r.status_code == 204
+
+    def test_no_token_returns_401(self, app_client):
+        r = app_client.post("/auth/logout")
+        assert r.status_code == 401
 
 
-def test_update_task_partial(client):
-    # Patching only is_done should leave the title unchanged
-    task_id = create_task(client, "Keep this title").json()["id"]
-    res = client.patch(f"/tasks/{task_id}", json={"is_done": True})
-    assert res.json()["title"] == "Keep this title"
-    assert res.json()["is_done"] is True
+# ── GET /tasks ────────────────────────────────────────────────────────────────
+
+class TestGetTasks:
+    def test_unauthenticated_returns_401(self, app_client):
+        r = app_client.get("/tasks")
+        assert r.status_code == 401
+
+    def test_expired_session_returns_401(self, app_client):
+        user, token, session_id = _make_user("tasks_user_exp")
+        with patch("session_manager.get_session_user_id", return_value=None):
+            r = app_client.get("/tasks", headers=_auth(token))
+        assert r.status_code == 401
+
+    def test_returns_empty_list(self, app_client):
+        user, token, session_id = _make_user("tasks_empty")
+        with patch("session_manager.get_session_user_id", return_value=user.id):
+            r = app_client.get("/tasks", headers=_auth(token))
+        assert r.status_code == 200
+        assert r.json() == []
+
+    def test_pagination_limit_enforced(self, app_client):
+        user, token, session_id = _make_user("tasks_page")
+        with patch("session_manager.get_session_user_id", return_value=user.id):
+            r = app_client.get("/tasks?limit=999", headers=_auth(token))
+        assert r.status_code == 422
 
 
-def test_update_task_empty_title_rejected(client):
-    # FIX #4 — blank title on update must also fail validation
-    task_id = create_task(client).json()["id"]
-    res = client.patch(f"/tasks/{task_id}", json={"title": ""})
-    assert res.status_code == 422
+# ── GET /tasks/:id ────────────────────────────────────────────────────────────
+
+class TestGetOneTask:
+    def test_unauthenticated_returns_401(self, app_client):
+        assert app_client.get("/tasks/some-id").status_code == 401
+
+    def test_nonexistent_returns_404(self, app_client):
+        user, token, _ = _make_user("getone_user")
+        with patch("session_manager.get_session_user_id", return_value=user.id):
+            r = app_client.get("/tasks/nonexistent", headers=_auth(token))
+        assert r.status_code == 404
 
 
-def test_update_task_not_found_returns_404(client):
-    # FIX #6
-    res = client.patch("/tasks/nonexistent-id", json={"is_done": True})
-    assert res.status_code == 404
+# ── POST /tasks ───────────────────────────────────────────────────────────────
+
+class TestCreateTask:
+    def test_returns_202_with_job_id(self, app_client):
+        user, token, _ = _make_user("create_user")
+        mock_job = MagicMock()
+        mock_job.id = "job-abc"
+        with patch("session_manager.get_session_user_id", return_value=user.id), \
+             patch("main.create_task_job") as mock_celery:
+            mock_celery.delay.return_value = mock_job
+            r = app_client.post("/tasks", json={"title": "Buy milk"}, headers=_auth(token))
+        assert r.status_code == 202
+        assert r.json()["job_id"] == "job-abc"
+        assert r.json()["status"] == "pending"
+
+    def test_unauthenticated_returns_401(self, app_client):
+        assert app_client.post("/tasks", json={"title": "Buy milk"}).status_code == 401
+
+    def test_empty_title_returns_422(self, app_client):
+        user, token, _ = _make_user("create_val")
+        with patch("session_manager.get_session_user_id", return_value=user.id):
+            r = app_client.post("/tasks", json={"title": ""}, headers=_auth(token))
+        assert r.status_code == 422
+
+    def test_whitespace_title_returns_422(self, app_client):
+        user, token, _ = _make_user("create_ws")
+        with patch("session_manager.get_session_user_id", return_value=user.id):
+            r = app_client.post("/tasks", json={"title": "   "}, headers=_auth(token))
+        assert r.status_code == 422
 
 
-# ── DELETE ────────────────────────────────────────────────────────────────────
+# ── PATCH /tasks/:id ──────────────────────────────────────────────────────────
 
-def test_delete_task(client):
-    task_id = create_task(client).json()["id"]
-    res = client.delete(f"/tasks/{task_id}")
-    assert res.status_code == 204
+class TestUpdateTask:
+    def test_returns_202_with_job_id(self, app_client):
+        user, token, _ = _make_user("upd_user")
+        mock_job = MagicMock()
+        mock_job.id = "job-upd"
+        with patch("session_manager.get_session_user_id", return_value=user.id), \
+             patch("main.update_task_job") as mock_celery:
+            mock_celery.delay.return_value = mock_job
+            r = app_client.patch("/tasks/some-id", json={"is_done": True}, headers=_auth(token))
+        assert r.status_code == 202
+        assert r.json()["job_id"] == "job-upd"
+
+    def test_unauthenticated_returns_401(self, app_client):
+        assert app_client.patch("/tasks/some-id", json={"is_done": True}).status_code == 401
+
+    def test_empty_title_returns_422(self, app_client):
+        user, token, _ = _make_user("upd_val")
+        with patch("session_manager.get_session_user_id", return_value=user.id):
+            r = app_client.patch("/tasks/some-id", json={"title": ""}, headers=_auth(token))
+        assert r.status_code == 422
 
 
-def test_delete_task_actually_removed(client):
-    task_id = create_task(client).json()["id"]
-    client.delete(f"/tasks/{task_id}")
-    res = client.get(f"/tasks/{task_id}")
-    assert res.status_code == 404
+# ── DELETE /tasks/:id ─────────────────────────────────────────────────────────
+
+class TestDeleteTask:
+    def test_returns_202_with_job_id(self, app_client):
+        user, token, _ = _make_user("del_user")
+        mock_job = MagicMock()
+        mock_job.id = "job-del"
+        with patch("session_manager.get_session_user_id", return_value=user.id), \
+             patch("main.delete_task_job") as mock_celery:
+            mock_celery.delay.return_value = mock_job
+            r = app_client.delete("/tasks/some-id", headers=_auth(token))
+        assert r.status_code == 202
+        assert r.json()["job_id"] == "job-del"
+
+    def test_unauthenticated_returns_401(self, app_client):
+        assert app_client.delete("/tasks/some-id").status_code == 401
 
 
-def test_delete_task_not_found_returns_404(client):
-    # FIX #6
-    res = client.delete("/tasks/nonexistent-id")
-    assert res.status_code == 404
+# ── GET /jobs/:id ─────────────────────────────────────────────────────────────
+
+class TestJobStatus:
+    def test_pending_job(self, app_client):
+        user, token, _ = _make_user("jobs_pend")
+        mock_result = MagicMock()
+        mock_result.status = "PENDING"
+        mock_result.result = None
+        with patch("session_manager.get_session_user_id", return_value=user.id), \
+             patch("main.AsyncResult", return_value=mock_result):
+            r = app_client.get("/jobs/job-123", headers=_auth(token))
+        assert r.status_code == 200
+        assert r.json()["status"] == "pending"
+
+    def test_success_job_includes_result(self, app_client):
+        user, token, _ = _make_user("jobs_ok")
+        mock_result = MagicMock()
+        mock_result.status = "SUCCESS"
+        mock_result.result = {"id": "t1", "title": "Done"}
+        with patch("session_manager.get_session_user_id", return_value=user.id), \
+             patch("main.AsyncResult", return_value=mock_result):
+            r = app_client.get("/jobs/job-456", headers=_auth(token))
+        assert r.status_code == 200
+        assert r.json()["status"] == "success"
+        assert r.json()["result"] is not None
+
+    def test_failed_job(self, app_client):
+        user, token, _ = _make_user("jobs_fail")
+        mock_result = MagicMock()
+        mock_result.status = "FAILURE"
+        mock_result.result = None
+        with patch("session_manager.get_session_user_id", return_value=user.id), \
+             patch("main.AsyncResult", return_value=mock_result):
+            r = app_client.get("/jobs/job-789", headers=_auth(token))
+        assert r.status_code == 200
+        assert r.json()["status"] == "failed"
+
+    def test_unauthenticated_returns_401(self, app_client):
+        assert app_client.get("/jobs/job-123").status_code == 401

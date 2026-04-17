@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flower
+  namespace: task-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: flower
+  template:
+    metadata:
+      labels:
+        app: flower
+    spec:
+      containers:
+        - name: flower
+          image: YOUR_REGISTRY/task-api:latest
+          command: ["celery", "-A", "celery_app", "flower", "--port=5555"]
+          envFrom:
+            - secretRef:
+                name: task-api-secrets
+          ports:
+            - containerPort: 5555
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: flower
+  namespace: task-api
+spec:
+  selector:
+    app: flower
+  ports:
+    - port: 5555

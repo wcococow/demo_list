@@ -1,0 +1,114 @@
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: task-api-alerts
+    folder: Task API
+    interval: 1m
+    rules:
+
+      - uid: high-error-rate
+        title: High Error Rate
+        condition: C
+        for: 2m
+        annotations:
+          summary: "Error rate above 5% for 2 minutes"
+          description: "{{ $labels.handler }} is returning errors at {{ $values.C }}%"
+        labels:
+          severity: critical
+        data:
+          - refId: A
+            datasourceUid: prometheus
+            model:
+              expr: >
+                sum(rate(http_requests_total{status=~"4..|5.."}[1m]))
+                / sum(rate(http_requests_total[1m])) * 100
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [5]
+                  query:
+                    params: [A]
+
+      - uid: high-latency
+        title: High Latency p95
+        condition: C
+        for: 2m
+        annotations:
+          summary: "p95 latency above 1 second for 2 minutes"
+          description: "p95 latency is {{ $values.C }}s — DB or Redis may be struggling"
+        labels:
+          severity: warning
+        data:
+          - refId: A
+            datasourceUid: prometheus
+            model:
+              expr: >
+                histogram_quantile(0.95,
+                  sum by (le) (rate(http_request_duration_seconds_bucket[1m])))
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [1]
+                  query:
+                    params: [A]
+
+      - uid: no-active-sessions
+        title: All Sessions Dropped
+        condition: C
+        for: 5m
+        annotations:
+          summary: "Active sessions dropped to 0"
+          description: "No active user sessions — possible service outage"
+        labels:
+          severity: critical
+        data:
+          - refId: A
+            datasourceUid: prometheus
+            model:
+              expr: active_sessions_total
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              conditions:
+                - evaluator:
+                    type: lt
+                    params: [1]
+                  query:
+                    params: [A]
+
+      - uid: worker-queue-depth
+        title: Queue Depth Spike
+        condition: C
+        for: 5m
+        annotations:
+          summary: "More than 500 jobs queued for 5 minutes"
+          description: "Workers may not be keeping up — consider scaling"
+        labels:
+          severity: warning
+        data:
+          - refId: A
+            datasourceUid: prometheus
+            model:
+              expr: >
+                sum(rate(http_requests_total{handler="/tasks",method="POST"}[1m]))
+                - sum(rate(http_requests_total{handler=~"/jobs/.*",status="200"}[1m]))
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [500]
+                  query:
+                    params: [A]

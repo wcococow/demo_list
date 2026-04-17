@@ -1,0 +1,25 @@
+# KEDA ScaledObject — scales workers based on Celery queue depth in Redis.
+# Install KEDA first: make install-keda
+#
+# Logic:
+#   queue depth / 10 = desired worker replicas
+#   e.g. 50 jobs in queue → 5 workers spun up automatically
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: worker-scaler
+  namespace: task-api
+spec:
+  scaleTargetRef:
+    name: worker
+  minReplicaCount: 1      # always keep 1 worker alive
+  maxReplicaCount: 20     # never exceed 20 workers
+  cooldownPeriod: 30      # seconds to wait before scaling down
+  triggers:
+    - type: redis
+      metadata:
+        address: redis.task-api.svc.cluster.local:6379
+        listName: celery      # Celery's default queue key
+        listLength: "10"      # 1 worker per 10 queued jobs
+        databaseIndex: "1"    # Celery uses DB 1
+        passwordFromEnv: REDIS_PASSWORD

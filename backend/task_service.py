@@ -1,13 +1,13 @@
 from sqlalchemy.orm import Session
+
 from models import Task
+from telemetry import tracer
 
 
-def create_task(db: Session, title: str):
-    task = Task(title=title)
+@tracer.start_as_current_span("task_service.create")
+def create_task(db: Session, title: str, owner_id: str):
+    task = Task(title=title, owner_id=owner_id)
     db.add(task)
-    # FIX #7: wrap commit in try/except so a DB error (e.g. constraint violation)
-    # triggers a rollback instead of leaving the session in a broken state,
-    # which would poison every subsequent request on the same connection
     try:
         db.commit()
         db.refresh(task)
@@ -17,17 +17,19 @@ def create_task(db: Session, title: str):
     return task
 
 
-# FIX #5: added skip/limit so callers can paginate instead of loading every row
-def get_all_tasks(db: Session, skip: int = 0, limit: int = 20):
-    return db.query(Task).offset(skip).limit(limit).all()
+@tracer.start_as_current_span("task_service.get_all")
+def get_all_tasks(db: Session, owner_id: str, skip: int = 0, limit: int = 20):
+    return db.query(Task).filter(Task.owner_id == owner_id).offset(skip).limit(limit).all()
 
 
+@tracer.start_as_current_span("task_service.get_one")
 def get_task_by_id(db: Session, task_id: str):
     return db.query(Task).filter(Task.id == task_id).first()
 
 
-def update_task(db: Session, task_id: str, title=None, is_done=None):
-    task = get_task_by_id(db, task_id)
+@tracer.start_as_current_span("task_service.update")
+def update_task(db: Session, task_id: str, owner_id: str, title=None, is_done=None):
+    task = db.query(Task).filter(Task.id == task_id, Task.owner_id == owner_id).first()
 
     if not task:
         return None
@@ -38,7 +40,6 @@ def update_task(db: Session, task_id: str, title=None, is_done=None):
     if is_done is not None:
         task.is_done = is_done
 
-    # FIX #7: rollback on commit failure to keep the session clean
     try:
         db.commit()
         db.refresh(task)
@@ -48,14 +49,14 @@ def update_task(db: Session, task_id: str, title=None, is_done=None):
     return task
 
 
-def delete_task(db: Session, task_id: str):
-    task = get_task_by_id(db, task_id)
+@tracer.start_as_current_span("task_service.delete")
+def delete_task(db: Session, task_id: str, owner_id: str):
+    task = db.query(Task).filter(Task.id == task_id, Task.owner_id == owner_id).first()
 
     if not task:
         return False
 
     db.delete(task)
-    # FIX #7: rollback on commit failure to keep the session clean
     try:
         db.commit()
     except Exception:

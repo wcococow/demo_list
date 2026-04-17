@@ -10,9 +10,36 @@ alembic==1.13.2           # DB migrations — required once you have production 
 # Validation
 pydantic==2.9.0
 
+# Auth — JWT tokens + password hashing
+python-jose[cryptography]==3.3.0
+bcrypt==5.0.0
+python-multipart==0.0.9   # required for OAuth2 form-based login
+
+# Redis — session storage
+redis==5.0.0
+
+# Task queue — Celery + Flower monitor
+celery[redis]==5.4.0
+flower==2.0.1
+
+# Metrics — Prometheus + Grafana
+prometheus-fastapi-instrumentator==7.1.0
+
+# OpenTelemetry — distributed tracing (Jaeger)
+opentelemetry-api==1.41.0
+opentelemetry-sdk==1.41.0
+opentelemetry-exporter-otlp-proto-grpc==1.41.0
+opentelemetry-instrumentation-fastapi==0.62b0
+opentelemetry-instrumentation-sqlalchemy==0.62b0
+opentelemetry-instrumentation-redis==0.62b0
+
 # Rate limiting
 slowapi==0.1.9
 
 # Testing
 httpx==0.27.0
 pytest==8.3.0
+pytest-mock==3.14.0
+
+# OpenTelemetry — Celery worker tracing
+opentelemetry-instrumentation-celery==0.62b0

@@ -1,0 +1,100 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: docker.io
+  IMAGE: ${{ secrets.DOCKER_USERNAME }}/task-api
+
+jobs:
+  # ── test ────────────────────────────────────────────────────────────────────
+  test:
+    name: Run tests
+    runs-on: ubuntu-latest
+    env:
+      SECRET_KEY: ci-test-secret-key-not-for-production
+      DATABASE_URL: sqlite:///./test.db
+      REDIS_URL: redis://localhost:6379/0
+
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        working-directory: backend
+        run: pip install -r requirements.txt
+
+      - name: Run service layer tests
+        working-directory: backend
+        run: pytest test_services.py -v
+
+      - name: Run API tests
+        working-directory: backend
+        run: pytest test_main.py -v
+
+  # ── build ───────────────────────────────────────────────────────────────────
+  build-push:
+    name: Build and push image
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ github.sha }}
+
+  # ── deploy ──────────────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy to K3s
+    runs-on: ubuntu-latest
+    needs: build-push
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG }}" > ~/.kube/config
+
+      - name: Update image tag
+        run: |
+          sed -i "s|YOUR_REGISTRY/task-api:latest|${{ env.IMAGE }}:${{ github.sha }}|g" k8s/*.yml
+
+      - name: Apply manifests
+        run: kubectl apply -f k8s/ --namespace=task-api
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/api -n task-api --timeout=120s
+          kubectl rollout status deployment/worker -n task-api --timeout=120s
