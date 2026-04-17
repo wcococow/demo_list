@@ -24,7 +24,8 @@ spec:
     spec:
       containers:
         - name: api
-          image: YOUR_REGISTRY/task-api:latest   # replace with your image
+          image: localhost:5000/task-api:latest   # replace with your image
+          imagePullPolicy: Always
           envFrom:
             - secretRef:
                 name: task-api-secrets

@@ -2,9 +2,9 @@ import os
 from datetime import datetime, timedelta, timezone
 
 import bcrypt
+import jwt
 from fastapi import Depends, HTTPException, Request
 from fastapi.security import OAuth2PasswordBearer
-from jose import JWTError, jwt
 from sqlalchemy.orm import Session
 
 from database import get_db
@@ -50,7 +50,7 @@ def get_current_user(
         session_id: str = payload.get("sid")
         if not user_id or not session_id:
             raise HTTPException(401, "Invalid token")
-    except JWTError:
+    except jwt.PyJWTError:
         raise HTTPException(401, "Invalid token")
 
     stored_user_id = get_session_user_id(session_id)
@@ -60,6 +60,8 @@ def get_current_user(
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(401, "User not found")
+    from log_context import user_id_ctx
+    user_id_ctx.set(user.id)
     return user
 
 
@@ -67,5 +69,5 @@ def get_session_id_from_token(token: str) -> str | None:
     try:
         payload = jwt.decode(token, _SECRET_KEY, algorithms=[ALGORITHM])
         return payload.get("sid")
-    except JWTError:
+    except jwt.PyJWTError:
         return None

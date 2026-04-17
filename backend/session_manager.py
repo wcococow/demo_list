@@ -36,7 +36,8 @@ def clear_failed_logins(username: str) -> None:
 # ── sessions ──────────────────────────────────────────────────────────────────
 
 def _count_active_sessions() -> int:
-    return len(redis_client.keys(f"{_PREFIX}*"))
+    # SCAN iterates in small chunks — never blocks Redis, unlike KEYS
+    return sum(1 for _ in redis_client.scan_iter(f"{_PREFIX}*", count=100))
 
 
 # Initialise from Redis so the gauge survives API restarts

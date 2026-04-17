@@ -18,6 +18,9 @@ groups:
           severity: critical
         data:
           - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
             datasourceUid: prometheus
             model:
               expr: >
@@ -45,6 +48,9 @@ groups:
           severity: warning
         data:
           - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
             datasourceUid: prometheus
             model:
               expr: >
@@ -72,6 +78,9 @@ groups:
           severity: critical
         data:
           - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
             datasourceUid: prometheus
             model:
               expr: active_sessions_total
@@ -97,6 +106,9 @@ groups:
           severity: warning
         data:
           - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
             datasourceUid: prometheus
             model:
               expr: >

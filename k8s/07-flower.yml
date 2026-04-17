@@ -15,7 +15,7 @@ spec:
     spec:
       containers:
         - name: flower
-          image: YOUR_REGISTRY/task-api:latest
+          image: localhost:5000/task-api:latest
           command: ["celery", "-A", "celery_app", "flower", "--port=5555"]
           envFrom:
             - secretRef:

@@ -3,11 +3,9 @@ import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 
-# Never hardcode credentials — read from environment.
-# In production set DATABASE_URL to a PostgreSQL DSN, e.g.:
-#   postgresql://user:password@host:5432/dbname
-# Falls back to SQLite only for local development.
-DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./tasks.db")
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL environment variable is not set")
 
 _is_sqlite = DATABASE_URL.startswith("sqlite")
 

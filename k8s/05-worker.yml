@@ -20,7 +20,8 @@ spec:
     spec:
       containers:
         - name: worker
-          image: YOUR_REGISTRY/task-api:latest   # same image as api
+          image: localhost:5000/task-api:latest   # same image as api
+          imagePullPolicy: Always
           command: ["celery", "-A", "celery_app", "worker",
                     "--loglevel=info", "--concurrency=4"]
           envFrom:

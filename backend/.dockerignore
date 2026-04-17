@@ -1,0 +1,14 @@
+.env
+.env.*
+__pycache__/
+*.pyc
+*.pyo
+test_*.py
+conftest.py
+.pytest_cache/
+*.egg-info/
+.git/
+.gitignore
+ARCHITECTURE.md
+test_endpoints.sh
+requirements-dev.txt
